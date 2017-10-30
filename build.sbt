@@ -1,7 +1,7 @@
 lazy val commonSettings =
   Seq(
     organization := "com.seancheatham",
-    scalaVersion := "2.12.4",
+    scalaVersion := "2.12.3",
     libraryDependencies ++=
       Dependencies.typesafe ++
         Dependencies.test ++

@@ -1,14 +1,17 @@
 package com.seancheatham.firebase.streams
 
-import java.nio.file.{Files, Path}
+import java.io.ByteArrayInputStream
+import java.nio.file.{Path, Paths}
 
 import akka.NotUsed
-import akka.stream.scaladsl.{Flow, Sink, Source}
+import akka.stream.Materializer
+import akka.stream.scaladsl.{FileIO, Flow, Source}
 import com.google.auth.oauth2.GoogleCredentials
 import com.google.firebase.{FirebaseApp, FirebaseOptions}
 import play.api.libs.json.JsValue
 
-import scala.util.Try
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success, Try}
 
 /**
   * A base client which provides an API for generating Sources, Sinks, and Flows for working with
@@ -45,8 +48,8 @@ class FirebaseClient(private val app: FirebaseApp) {
     *
     * @param path The Firebase Ref path (i.e. /threads/1/body)
     */
-  def valueSink(path: String): Sink[Option[JsValue], NotUsed] =
-    Sink.fromGraph(new ValueSink(path, app))
+  def valueFlow(path: String): Flow[Option[JsValue], String, NotUsed] =
+    Flow.fromGraph(new ValueFlow(path, app))
 
   /**
     * Constructs a flow which appends values to the given Firebase reference.  Emitted values are
@@ -69,20 +72,36 @@ object FirebaseClient {
     * @param credentialsJson The Path to a local google-services.json
     * @return a FirebaseClient
     */
-  def fromGoogleServicesJson(databaseUrl: String,
-                             credentialsJson: Path): Try[FirebaseClient] =
-    Try(GoogleCredentials.fromStream(Files.newInputStream(credentialsJson)))
-      .flatMap(credentials =>
-        Try(
-          FirebaseApp.initializeApp(
-            new FirebaseOptions.Builder()
-              .setCredentials(credentials)
-              .setDatabaseUrl(databaseUrl)
-              .build()
-          )
+  def fromGoogleServicesJson(databaseUrl: String, credentialsJson: Path)
+                            (implicit mat: Materializer, ec: ExecutionContext): Future[FirebaseClient] =
+    FileIO.fromPath(credentialsJson)
+      .runReduce(_ ++ _)
+      .map(bs => new ByteArrayInputStream(bs.toArray))
+      .flatMap(is =>
+        Future.fromTry(
+          Try(GoogleCredentials.fromStream(is))
+            .flatMap(credentials =>
+              Try(
+                FirebaseApp.initializeApp(
+                  new FirebaseOptions.Builder()
+                    .setCredentials(credentials)
+                    .setDatabaseUrl(databaseUrl)
+                    .build()
+                )
+              )
+                .map(new FirebaseClient(_))
+            )
         )
       )
-      .map(new FirebaseClient(_))
+
+  /**
+    * This variable is specific to Google.  It is a private value declared in their configuration class, so we'll simply
+    * duplicate it here.
+    *
+    * @see [[com.google.auth.oauth2.DefaultCredentialsProvider#CREDENTIAL_ENV_VAR]]
+    */
+  private val defaultCredentialsEnvVariable =
+    "GOOGLE_APPLICATION_CREDENTIALS"
 
   /**
     * Construct a FirebaseClient using the given URL.  The Firebase SDK will read in the credentials
@@ -92,18 +111,19 @@ object FirebaseClient {
     * @param databaseUrl The Database URL
     * @return a FirebaseClient
     */
-  def default(databaseUrl: String): Try[FirebaseClient] =
-    Try(GoogleCredentials.getApplicationDefault)
-      .flatMap(credentials =>
-        Try(
-          FirebaseApp.initializeApp(
-            new FirebaseOptions.Builder()
-              .setCredentials(credentials)
-              .setDatabaseUrl(databaseUrl)
-              .build()
-          )
-        )
+  def default(databaseUrl: String)
+             (implicit mat: Materializer, ec: ExecutionContext): Future[FirebaseClient] =
+    Future.fromTry(
+      Try(
+        Option(System.getenv(defaultCredentialsEnvVariable))
       )
-      .map(new FirebaseClient(_))
+        .flatMap {
+          case Some(v) =>
+            Success(Paths.get(v))
+          case _ =>
+            Failure(new IllegalArgumentException(s"No env variable set at $defaultCredentialsEnvVariable"))
+        }
+    )
+      .flatMap(fromGoogleServicesJson(databaseUrl, _))
 
 }

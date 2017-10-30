@@ -20,7 +20,7 @@ class ValueListenerSource(path: String,
                           bufferSize: Int) extends GraphStage[SourceShape[Option[JsValue]]] {
 
   private val out =
-    Outlet("FirebaseValue.out")
+    Outlet[Option[JsValue]]("FirebaseValue.out")
 
   override val shape =
     SourceShape(out)

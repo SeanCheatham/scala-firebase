@@ -21,7 +21,7 @@ class ChildListenerSource(path: String,
                           bufferSize: Int) extends GraphStage[SourceShape[ChildListenerSource.ChildEvent]] {
 
   private val out =
-    Outlet("FirebaseChild.out")
+    Outlet[ChildListenerSource.ChildEvent]("FirebaseChild.out")
 
   override val shape =
     SourceShape(out)

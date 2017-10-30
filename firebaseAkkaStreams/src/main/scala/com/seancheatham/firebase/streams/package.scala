@@ -1,6 +1,11 @@
 package com.seancheatham.firebase
 
+import java.util.concurrent.Executor
+
 import play.api.libs.json._
+
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.Try
 
 package object streams {
 
@@ -17,6 +22,25 @@ package object streams {
         case x =>
           Some(x)
       }
+  }
+
+  implicit class GoogleFutureHelper[T](f: com.google.api.core.ApiFuture[T]) {
+    def asFuture(implicit ec: Executor): Future[T] = {
+      val promise =
+        Promise[T]()
+      f.addListener(
+        new Runnable {
+          override def run(): Unit = {
+            require(f.isDone)
+            promise.complete(
+              Try(f.get())
+            )
+          }
+        },
+        ec
+      )
+      promise.future
+    }
   }
 
   /**
