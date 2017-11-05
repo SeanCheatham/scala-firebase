@@ -3,14 +3,15 @@ package com.seancheatham.firebase.streams
 import java.io.ByteArrayInputStream
 import java.nio.file.{Path, Paths}
 
-import akka.NotUsed
 import akka.stream.Materializer
 import akka.stream.scaladsl.{FileIO, Flow, Source}
+import akka.{Done, NotUsed}
 import com.google.auth.oauth2.GoogleCredentials
+import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.{FirebaseApp, FirebaseOptions}
-import play.api.libs.json.JsValue
+import play.api.libs.json.{Reads, Writes}
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutor, Future}
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -19,7 +20,7 @@ import scala.util.{Failure, Success, Try}
   *
   * @param app The FirebaseApp SDK client
   */
-class FirebaseClient(private val app: FirebaseApp) {
+class FirebaseClient()(private implicit val app: FirebaseApp) {
 
   /**
     * Constructs a value-change Source at the given Firebase Ref.  This will attach a listener that pipes value changes
@@ -28,9 +29,9 @@ class FirebaseClient(private val app: FirebaseApp) {
     *
     * @param path The Firebase Ref path (i.e. /threads/1/body)
     */
-  def valueSource(path: String,
-                  bufferSize: Int = 100): Source[Option[JsValue], NotUsed] =
-    Source.fromGraph(new ValueListenerSource(path, app, bufferSize))
+  def valueSource[T](path: String)
+                    (implicit r: Reads[T]): Source[Option[T], NotUsed] =
+    Source.fromGraph(new ValueListenerSource(path, app))
 
   /**
     * Constructs a child-change Source at the given Firebase Ref.  This will attach a listener that pipes value changes
@@ -39,17 +40,52 @@ class FirebaseClient(private val app: FirebaseApp) {
     *
     * @param path The Firebase Ref path (i.e. /threads/1/comments)
     */
-  def childSource(path: String,
-                  bufferSize: Int = 100): Source[ChildListenerSource.ChildEvent, NotUsed] =
+  def childSource[T](path: String,
+                     bufferSize: Int = 100)
+                    (implicit r: Reads[T]): Source[ChildListenerSource.ChildEvent[T], NotUsed] =
     Source.fromGraph(new ChildListenerSource(path, app, bufferSize))
 
   /**
-    * Constructs a sink which writes/deletes values at the given Firebase Ref.
+    * Perform a one-time read of the given path, producing an optional JsValue.
     *
-    * @param path The Firebase Ref path (i.e. /threads/1/body)
+    * @param path The path to read
+    * @return a Future with an optional JsValue.  None indicates no value existed.
     */
-  def valueFlow(path: String): Flow[Option[JsValue], String, NotUsed] =
-    Flow.fromGraph(new ValueFlow(path, app))
+  def readOnce[T](path: String)(implicit r: Reads[T]): Future[Option[T]] =
+    SingleValueListener(path)
+
+  /**
+    * Write a value to the Firebase Database
+    *
+    * @param path  The full path to the value to be written
+    * @param value The JSON value to write
+    * @return a Future indicating success
+    */
+  def write[T](path: String, value: T)(implicit mat: Materializer, w: Writes[T]): Future[Done] = {
+    implicit val ec: ExecutionContextExecutor = mat.executionContext
+    FirebaseDatabase
+      .getInstance(app)
+      .getReference(path)
+      .setValueAsync(jsonToAny(w.writes(value)))
+      .asFuture
+      .map(_ => Done)
+  }
+
+  /**
+    * Deletes a value from the Firebase Database
+    *
+    * @param path The full path to the value to be deleted
+    * @return a Future indicating success
+    */
+  def remove(path: String)(implicit mat: Materializer): Future[Done] = {
+    implicit val ec: ExecutionContextExecutor = mat.executionContext
+    FirebaseDatabase
+      .getInstance(app)
+      .getReference(path)
+      .removeValueAsync()
+      .asFuture
+      .map(_ => Done)
+  }
 
   /**
     * Constructs a flow which appends values to the given Firebase reference.  Emitted values are
@@ -57,7 +93,7 @@ class FirebaseClient(private val app: FirebaseApp) {
     *
     * @param path The Firebase Ref path (i.e. /threads/1/comments)
     */
-  def push(path: String): Flow[JsValue, String, NotUsed] =
+  def push[T](path: String)(implicit w: Writes[T]): Flow[T, String, NotUsed] =
     Flow.fromGraph(new PushFlow(path, app))
 
 }
@@ -67,6 +103,9 @@ object FirebaseClient {
   /**
     * Construct a FirebaseClient using the given URL and Credentials Path.  The Path
     * should point to a google-services.json file, which is read in by the Firebase SDK.
+    *
+    * Rather than permit the Firebase SDK to use blocking mechanisms to read in the credentials file, we use
+    * Akka Streams FileIO to buffer the contents in memory, and then create a bytestream from the buffered contents.
     *
     * @param databaseUrl     The Database URL
     * @param credentialsJson The Path to a local google-services.json
@@ -89,7 +128,7 @@ object FirebaseClient {
                     .build()
                 )
               )
-                .map(new FirebaseClient(_))
+                .map(new FirebaseClient()(_))
             )
         )
       )

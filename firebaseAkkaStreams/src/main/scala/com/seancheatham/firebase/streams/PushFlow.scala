@@ -5,7 +5,7 @@ import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import com.google.firebase.FirebaseApp
 import com.google.firebase.database.DatabaseReference.CompletionListener
 import com.google.firebase.database._
-import play.api.libs.json.JsValue
+import play.api.libs.json.Writes
 
 /**
   * A GraphStage which appends values to the given Firebase reference.  Values will be written
@@ -14,11 +14,11 @@ import play.api.libs.json.JsValue
   * @param path        A Firebase reference path
   * @param firebaseApp An initialized Firebase App
   */
-class PushFlow(path: String,
-               firebaseApp: => FirebaseApp) extends GraphStage[FlowShape[JsValue, String]] {
+class PushFlow[T](path: String,
+                  firebaseApp: => FirebaseApp)(implicit w: Writes[T]) extends GraphStage[FlowShape[T, String]] {
 
   private val in =
-    Inlet[JsValue]("FirebasePush.in")
+    Inlet[T]("FirebasePush.in")
 
   private val out =
     Outlet[String]("FirebasePush.out")
@@ -34,24 +34,25 @@ class PushFlow(path: String,
       private val reference =
         database.getReference(path)
 
-      private val defaultCompletionListener =
-        new CompletionListener {
-          override def onComplete(error: DatabaseError, ref: DatabaseReference): Unit =
-            Option(error) match {
-              case Some(e) =>
-                failStage(e.toException)
-              case None =>
-                push(out, ref.getKey)
-            }
-        }
-
       setHandler(
         in,
         new InHandler {
           override def onPush(): Unit = {
-            val value = jsonToAny(grab(in))
+            val value = jsonToAny(w.writes(grab(in)))
             val pushRef = reference.push()
-            pushRef.setValue(value, defaultCompletionListener)
+            val asyncCallbck = getAsyncCallback[String](push(out, _))
+            pushRef.setValue(
+              value,
+              new CompletionListener {
+                override def onComplete(error: DatabaseError, ref: DatabaseReference): Unit =
+                  Option(error) match {
+                    case Some(e) =>
+                      failStage(e.toException)
+                    case None =>
+                      asyncCallbck.invoke(ref.getKey)
+                  }
+              }
+            )
           }
         }
       )
