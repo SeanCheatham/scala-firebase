@@ -38,12 +38,22 @@ class FirebaseClient()(private implicit val app: FirebaseApp) {
     * downstream.  If [[Some]] value is provided, it is the updated value.  If [[None]] is provided,
     * the value was deleted.
     *
+    * NOTE: This GraphStage assumes that the child keys will be "in order".  It is recommended
+    * that realtime data inserts be created using the Firebase "push" mechanism to ensure the
+    * generated keys follow a particular order.
+    *
     * @param path The Firebase Ref path (i.e. /threads/1/comments)
+    * @param bufferSize Rather than leaving an unbounded listener to attached, this Source simulates
+    *                   backpressure by buffering X elements and detaching the listener until more are needed.
+    * @param openEnded When true, this Source will not complete, and will instead emit elements until downstream cancels.
+    *                  When false, only elements existing at the time the "last" element is read will be pushed downstream.
+    *                  Once the final element is read, the stage will complete.
     */
   def childSource[T](path: String,
-                     bufferSize: Int = 100)
+                     bufferSize: Int = 100,
+                     openEnded: Boolean = true)
                     (implicit r: Reads[T]): Source[ChildListenerSource.ChildEvent[T], NotUsed] =
-    Source.fromGraph(new ChildListenerSource(path, app, bufferSize))
+    Source.fromGraph(new ChildListenerSource(path, app, bufferSize, openEnded))
 
   /**
     * Perform a one-time read of the given path, producing an optional JsValue.
@@ -93,8 +103,18 @@ class FirebaseClient()(private implicit val app: FirebaseApp) {
     *
     * @param path The Firebase Ref path (i.e. /threads/1/comments)
     */
-  def push[T](path: String)(implicit w: Writes[T]): Flow[T, String, NotUsed] =
-    Flow.fromGraph(new PushFlow(path, app))
+  def push[T](path: String)(implicit w: Writes[T], mat: Materializer): Flow[T, String, NotUsed] =
+    Flow[T]
+      .mapAsync(1) { t =>
+        implicit val ec: ExecutionContextExecutor = mat.executionContext
+        val ref =
+          FirebaseDatabase.getInstance(app)
+            .getReference(path)
+            .push()
+        ref.setValueAsync(jsonToAny(w.writes(t)))
+          .asFuture
+          .map(_ => ref.getKey)
+      }
 
 }
 

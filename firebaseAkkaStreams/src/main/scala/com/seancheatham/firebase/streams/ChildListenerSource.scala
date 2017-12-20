@@ -1,10 +1,15 @@
 package com.seancheatham.firebase.streams
 
+import java.util.concurrent.TimeoutException
+
 import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
 import com.google.firebase.FirebaseApp
 import com.google.firebase.database._
 import play.api.libs.json.Reads
+
+import scala.concurrent.{ExecutionContextExecutor, Future, Promise}
+import scala.util.Success
 
 /**
   * A GraphStage which attaches a Firebase Child Event Listener to the given path.  Any changes
@@ -18,7 +23,8 @@ import play.api.libs.json.Reads
   */
 class ChildListenerSource[T](path: String,
                              firebaseApp: => FirebaseApp,
-                             bufferSize: Int)(implicit r: Reads[T]) extends GraphStage[SourceShape[ChildListenerSource.ChildEvent[T]]] {
+                             bufferSize: Int,
+                             openEnded: Boolean)(implicit r: Reads[T]) extends GraphStage[SourceShape[ChildListenerSource.ChildEvent[T]]] {
 
   private val out =
     Outlet[ChildListenerSource.ChildEvent[T]]("FirebaseChild.out")
@@ -45,6 +51,12 @@ class ChildListenerSource[T](path: String,
 
       private var lastQuery: Option[Query] =
         None
+
+      private var finalKey: Option[String] =
+        None
+
+      private var setFinalKeyAttempted: Boolean =
+        false
 
       private val listener: ChildEventListener =
         new ChildEventListener {
@@ -74,7 +86,7 @@ class ChildListenerSource[T](path: String,
               }
 
           override def onChildAdded(snapshot: DataSnapshot, previousChildName: String): Unit = {
-            if(!lastReadKey.contains(snapshot.getKey))
+            if (!lastReadKey.contains(snapshot.getKey))
               r.reads(anyToJson(snapshot.getValue)).asOpt
                 .foreach { v =>
                   listenerCallback.invoke(
@@ -100,14 +112,21 @@ class ChildListenerSource[T](path: String,
 
       private var errorCallback: AsyncCallback[Throwable] = _
 
+      private var shouldComplete: Boolean = false
+
       private def updateKeyState(key: String): Unit = {
         log.info(s"Updating key state to $key. Previous as $lastReadKey")
         batchReadCount += 1
         lastReadKey = Some(key)
         if (batchReadCount >= bufferSize) {
-          lastQuery.foreach(_.removeEventListener(listener))
+          detachCurrentListener()
           lastQuery = None
           batchReadCount = 0
+        }
+
+        if (finalKey.contains(key)) {
+          shouldComplete = true
+          done()
         }
       }
 
@@ -116,6 +135,48 @@ class ChildListenerSource[T](path: String,
           buffer.dequeue()
         buffer.enqueue(item)
         pushAvailable()
+      }
+
+      private def setFinalKey(): Future[String] = {
+        setFinalKeyAttempted = true
+        val query =
+          reference.orderByKey().limitToLast(1)
+        val promise =
+          Promise[String]()
+        val finalKeyListener =
+          new ChildEventListener {
+            override def onCancelled(error: DatabaseError): Unit =
+              promise.tryFailure(error.toException)
+
+            override def onChildChanged(snapshot: DataSnapshot, previousChildName: String): Unit = ()
+
+            override def onChildMoved(snapshot: DataSnapshot, previousChildName: String): Unit = ()
+
+            override def onChildAdded(snapshot: DataSnapshot, previousChildName: String): Unit = {
+              promise.trySuccess(snapshot.getKey)
+            }
+
+            override def onChildRemoved(snapshot: DataSnapshot): Unit = ()
+          }
+        query.addChildEventListener(finalKeyListener)
+        import scala.concurrent.duration._
+        materializer.scheduleOnce(
+          2.seconds,
+          () => if (!promise.isCompleted)
+            promise.tryFailure(
+              new TimeoutException("Could not fetch last key, likely an empty collection.")
+            )
+        )
+        implicit val ec: ExecutionContextExecutor = materializer.executionContext
+        promise.future
+          .andThen {
+            case Success(k) =>
+              finalKey = Some(k)
+          }
+          .andThen {
+            case _ =>
+              query.removeEventListener(finalKeyListener)
+          }
       }
 
       override def preStart(): Unit = {
@@ -134,7 +195,7 @@ class ChildListenerSource[T](path: String,
       }
 
       override def postStop(): Unit = {
-        lastQuery.foreach(_.removeEventListener(listener))
+        detachCurrentListener()
         super.postStop()
       }
 
@@ -145,24 +206,45 @@ class ChildListenerSource[T](path: String,
           .limitToFirst(bufferSize + lastReadKey.size)
       }
 
-      def pushAvailable(): Unit =
+      def pushAvailable(): Unit = {
         if (isAvailable(out) && buffer.nonEmpty) {
           val item = buffer.dequeue()
           log.info(s"Pushing $item")
           push(out, item)
         }
+        if (shouldComplete && buffer.isEmpty)
+          done()
+      }
 
       override def onPull(): Unit =
-        if (buffer.nonEmpty) {
-          pushAvailable()
-        } else if (lastQuery.isEmpty) {
-          lastQuery = Some(constructQuery())
-          lastQuery.foreach(_.addChildEventListener(listener))
+        if (openEnded && !setFinalKeyAttempted) {
+          implicit val ec: ExecutionContextExecutor = materializer.executionContext
+          val cb = getAsyncCallback[Unit](_ => onPull())
+          setFinalKey()
+            .onComplete(_ => cb.invoke())
+        } else {
+          if (buffer.nonEmpty) {
+            pushAvailable()
+          } else if (lastQuery.isEmpty) {
+            lastQuery = Some(constructQuery())
+            lastQuery.foreach(_.addChildEventListener(listener))
+          }
         }
 
       override def onDownstreamFinish(): Unit = {
         super.onDownstreamFinish()
+        detachCurrentListener()
+      }
+
+      private def detachCurrentListener(): Unit =
         lastQuery.foreach(_.removeEventListener(listener))
+
+      private def done(): Unit = {
+        detachCurrentListener()
+        if (buffer.isEmpty)
+          completeStage()
+        else
+          pushAvailable()
       }
 
       setHandler(out, this)

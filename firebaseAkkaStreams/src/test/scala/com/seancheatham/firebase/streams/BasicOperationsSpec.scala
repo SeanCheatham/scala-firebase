@@ -12,14 +12,22 @@ class BasicOperationsSpec extends WordSpec with BeforeAndAfterAll {
 
   override def beforeAll(): Unit = {
     Await.result(
-      client.remove(basePath + "/basicWrite"),
+      client.remove(basePath + "/writeTest"),
+      timeout
+    )
+    Await.result(
+      client.remove(basePath + "/objectWrite"),
       timeout
     )
   }
 
   override def afterAll(): Unit = {
     Await.result(
-      client.remove(basePath + "/basicWrite"),
+      client.remove(basePath + "/writeTest"),
+      timeout
+    )
+    Await.result(
+      client.remove(basePath + "/objectWrite"),
       timeout
     )
   }
@@ -27,7 +35,7 @@ class BasicOperationsSpec extends WordSpec with BeforeAndAfterAll {
   "The Firebase client" can {
     "write a value to the database" in {
       val path =
-        basePath + "/basicWrite"
+        basePath + "/writeTest"
 
       val runResult =
         Await.result(
@@ -41,7 +49,7 @@ class BasicOperationsSpec extends WordSpec with BeforeAndAfterAll {
 
     "read that value back" in {
       val path =
-        basePath + "/basicWrite"
+        basePath + "/writeTest"
 
       val runResult =
         Await.result(
@@ -54,7 +62,7 @@ class BasicOperationsSpec extends WordSpec with BeforeAndAfterAll {
 
     "delete that value" in {
       val path =
-        basePath + "/basicWrite"
+        basePath + "/writeTest"
 
       val runResult =
         Await.result(

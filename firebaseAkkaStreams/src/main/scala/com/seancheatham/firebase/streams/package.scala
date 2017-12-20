@@ -4,15 +4,10 @@ import java.util.concurrent.Executor
 
 import play.api.libs.json._
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.{Future, Promise}
 import scala.util.Try
 
 package object streams {
-
-  implicit class KeyHelper(key: Seq[String]) {
-    def keyify: String =
-      key mkString "/"
-  }
 
   implicit class JsHelper(v: JsValue) {
     def toOption: Option[JsValue] =
@@ -31,10 +26,12 @@ package object streams {
       f.addListener(
         new Runnable {
           override def run(): Unit = {
-            require(f.isDone)
-            promise.complete(
-              Try(f.get())
-            )
+            if (!f.isDone)
+              promise.failure(new IllegalStateException("Google Listener returned but task not marked done"))
+            else
+              promise.complete(
+                Try(f.get())
+              )
           }
         },
         ec
